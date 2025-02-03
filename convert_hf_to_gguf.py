@@ -4091,8 +4091,20 @@ class DeepseekV2Model(Model):
                 self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * hparams["rope_scaling"]["mscale_all_dim"])
 
     _experts: list[dict[str, Tensor]] | None = None
+    _scale_inv_dict: dict[str, Tensor] = {}
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # skip *_scale_inv
+        if name.endswith("_scale_inv"):
+            return []
+
+        # dequant weight on the fly using *_scale_inv
+        if name.endswith("weight"):
+            scale_inv_name = f"{name}_scale_inv"
+            if scale_inv_name in self._scale_inv_dict:
+                scale_inv = self._scale_inv_dict.pop(scale_inv_name)
+                data_torch = LazyTorchTensor.from_dsv3_dequant(data_torch, scale_inv)
+
         # rename e_score_correction_bias tensors
         if name.endswith("e_score_correction_bias"):
             name = name.replace("e_score_correction_bias", "e_score_correction.bias")
@@ -4161,6 +4173,10 @@ class DeepseekV2Model(Model):
         return [(self.map_tensor_name(name), data_torch)]
 
     def prepare_tensors(self):
+        for name, tensor in super().get_tensors():
+            if name.endswith('_scale_inv'):
+                self._scale_inv_dict[name] = tensor
+
         super().prepare_tensors()
 
         if self._experts is not None:
@@ -4982,6 +4998,69 @@ class LazyTorchTensor(gguf.LazyBase):
         dtype = cls._dtype_str_map[st_slice.get_dtype()]
         shape: tuple[int, ...] = tuple(st_slice.get_shape())
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(st_slice,), func=lambda s: s[:])
+        return cast(torch.Tensor, lazy)
+
+    @classmethod
+    def from_dsv3_dequant(cls, weight, weight_scale_inv) -> Tensor:
+        import triton.language as tl
+        import triton
+
+        # taken from deepseek-v3 repo
+
+        @triton.jit
+        def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+            """
+            Dequantizes weights using the provided scaling factors and stores the result.
+
+            Args:
+                x_ptr (tl.pointer): Pointer to the quantized weights.
+                s_ptr (tl.pointer): Pointer to the scaling factors.
+                y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+                M (int): Number of rows in the weight matrix.
+                N (int): Number of columns in the weight matrix.
+                BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+            Returns:
+                None
+            """
+            pid_m = tl.program_id(axis=0)
+            pid_n = tl.program_id(axis=1)
+            n = tl.cdiv(N, BLOCK_SIZE)
+            offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            offs = offs_m[:, None] * N + offs_n[None, :]
+            mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+            x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+            s = tl.load(s_ptr + pid_m * n + pid_n)
+            y = x * s
+            tl.store(y_ptr + offs, y, mask=mask)
+
+
+        def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+            """
+            Dequantizes the given weight tensor using the provided scale tensor.
+
+            Args:
+                x (torch.Tensor): The quantized weight tensor of shape (M, N).
+                s (torch.Tensor): The scale tensor of shape (M, N).
+                block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+            Returns:
+                torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+            Raises:
+                AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+            """
+            assert x.is_contiguous() and s.is_contiguous()
+            assert x.dim() == 2 and s.dim() == 2
+            M, N = x.size()
+            y = torch.empty_like(x, dtype=torch.get_default_dtype())
+            grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+            weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+            return y
+
+
+        lazy = cls(meta=cls.meta_with_dtype_and_shape(weight.dtype, weight.shape), args=(weight, weight_scale_inv), func=lambda w, wsi: weight_dequant(w, wsi))
         return cast(torch.Tensor, lazy)
 
     @classmethod
