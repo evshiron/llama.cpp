@@ -4947,6 +4947,67 @@ class ChameleonModel(Model):
 ###### CONVERSION LOGIC ######
 
 
+try:
+    import triton.language as tl
+    import triton
+
+    # taken from deepseek-v3 repo
+
+    @triton.jit
+    def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+        """
+        Dequantizes weights using the provided scaling factors and stores the result.
+
+        Args:
+            x_ptr (tl.pointer): Pointer to the quantized weights.
+            s_ptr (tl.pointer): Pointer to the scaling factors.
+            y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+            M (int): Number of rows in the weight matrix.
+            N (int): Number of columns in the weight matrix.
+            BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+        Returns:
+            None
+        """
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+        n = tl.cdiv(N, BLOCK_SIZE)
+        offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offs = offs_m[:, None] * N + offs_n[None, :]
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+        s = tl.load(s_ptr + pid_m * n + pid_n)
+        y = x * s
+        tl.store(y_ptr + offs, y, mask=mask)
+
+
+    def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+        """
+        Dequantizes the given weight tensor using the provided scale tensor.
+
+        Args:
+            x (torch.Tensor): The quantized weight tensor of shape (M, N).
+            s (torch.Tensor): The scale tensor of shape (M, N).
+            block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+        Returns:
+            torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+        Raises:
+            AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+        """
+        assert x.is_contiguous() and s.is_contiguous()
+        assert x.dim() == 2 and s.dim() == 2
+        M, N = x.size()
+        y = torch.empty_like(x, dtype=torch.get_default_dtype())
+        grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
+        weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+        return y
+except:
+    pass
+
+
 # tree of lazy tensors
 class LazyTorchTensor(gguf.LazyBase):
     _tensor_type = torch.Tensor
@@ -5002,64 +5063,6 @@ class LazyTorchTensor(gguf.LazyBase):
 
     @classmethod
     def from_dsv3_dequant(cls, weight, weight_scale_inv) -> Tensor:
-        import triton.language as tl
-        import triton
-
-        # taken from deepseek-v3 repo
-
-        @triton.jit
-        def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
-            """
-            Dequantizes weights using the provided scaling factors and stores the result.
-
-            Args:
-                x_ptr (tl.pointer): Pointer to the quantized weights.
-                s_ptr (tl.pointer): Pointer to the scaling factors.
-                y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
-                M (int): Number of rows in the weight matrix.
-                N (int): Number of columns in the weight matrix.
-                BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
-
-            Returns:
-                None
-            """
-            pid_m = tl.program_id(axis=0)
-            pid_n = tl.program_id(axis=1)
-            n = tl.cdiv(N, BLOCK_SIZE)
-            offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            offs = offs_m[:, None] * N + offs_n[None, :]
-            mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-            x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-            s = tl.load(s_ptr + pid_m * n + pid_n)
-            y = x * s
-            tl.store(y_ptr + offs, y, mask=mask)
-
-
-        def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
-            """
-            Dequantizes the given weight tensor using the provided scale tensor.
-
-            Args:
-                x (torch.Tensor): The quantized weight tensor of shape (M, N).
-                s (torch.Tensor): The scale tensor of shape (M, N).
-                block_size (int, optional): The block size to use for dequantization. Defaults to 128.
-
-            Returns:
-                torch.Tensor: The dequantized weight tensor of the same shape as `x`.
-
-            Raises:
-                AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
-            """
-            assert x.is_contiguous() and s.is_contiguous()
-            assert x.dim() == 2 and s.dim() == 2
-            M, N = x.size()
-            y = torch.empty_like(x, dtype=torch.get_default_dtype())
-            grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
-            weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
-            return y
-
-
         lazy = cls(meta=cls.meta_with_dtype_and_shape(weight.dtype, weight.shape), args=(weight, weight_scale_inv), func=lambda w, wsi: weight_dequant(w, wsi))
         return cast(torch.Tensor, lazy)
 
